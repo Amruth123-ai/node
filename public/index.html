@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BTC T3 Trend Bot</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            background: #111; 
+            color: #eee; 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; 
+            padding: 20px; 
+            min-height: 100vh;
+        }
+        .header { 
+            text-align: center; 
+            margin-bottom: 30px; 
+            padding-bottom: 20px;
+            border-bottom: 2px solid #333;
+        }
+        h1 { 
+            color: #0a4; 
+            font-size: 2em; 
+            margin-bottom: 5px;
+        }
+        .status { 
+            font-size: 1.1em; 
+            opacity: 0.8;
+        }
+        .logs { max-height: 70vh; overflow-y: auto; }
+        .log { 
+            padding: 15px; 
+            margin: 10px 0; 
+            border-radius: 12px; 
+            transition: all 0.3s ease;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .log.UPTREND { 
+            background: linear-gradient(135deg, #0a4, #0d6); 
+            box-shadow: 0 4px 20px rgba(0, 255, 0, 0.3);
+        }
+        
+        .DOWNTREND { 
+            background: linear-gradient(135deg, #a00, #c00); 
+            box-shadow: 0 4px 20px rgba(255, 0, 0, 0.3);
+        }
+        .log b { color: #fff; }
+        .metrics { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
+            gap: 20px; 
+            margin: 20px 0;
+        }
+        .metric { 
+            background: rgba(255,255,255,0.05); 
+            padding: 20px; 
+            border-radius: 12px; 
+            text-align: center;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .metric h3 { color: #0a4; font-size: 2em; margin-bottom: 5px; }
+        .metric.UPTREND h3 { color: #0a4; }
+        .metric.DOWNTREND h3 { color: #a00; }
+        @media (max-width: 768px) {
+            body { padding: 10px; }
+            h1 { font-size: 1.5em; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🟢🔴 BTC/USDT 2H T3 Trend Bot</h1>
+        <div class="status" id="status">Connecting...</div>
+    </div>
+    
+    <div class="metrics">
+        <div class="metric">
+            <h3 id="logCount">0</h3>
+            <div>Trend Alerts</div>
+        </div>
+        <div class="metric" id="trendMetric">
+            <h3 id="currentTrend">-</h3>
+            <div>Current Trend</div>
+        </div>
+        <div class="metric">
+            <h3 id="uptime">-</h3>
+            <div>Uptime</div>
+        </div>
+    </div>
+    
+    <div class="logs" id="logs"></div>
+
+    <script>
+        const socket = io();
+        const logsContainer = document.getElementById('logs');
+        const statusEl = document.getElementById('status');
+        const logCountEl = document.getElementById('logCount');
+        const currentTrendEl = document.getElementById('currentTrend');
+        const trendMetricEl = document.getElementById('trendMetric');
+        const uptimeEl = document.getElementById('uptime');
+
+        function renderLogs(logs) {
+            logsContainer.innerHTML = logs.slice(-50).reverse().map(l => 
+                `<div class="log ${l.trend}">
+                    <b>${l.time}</b> — ${l.trend}
+                </div>`
+            ).join('');
+            logCountEl.textContent = logs.length;
+        }
+
+        socket.on('connect', () => {
+            statusEl.textContent = '🟢 Live - Real-time updates';
+            statusEl.style.color = '#0a4';
+        });
+
+        socket.on('log-update', (logs) => {
+            renderLogs(logs);
+            if (logs.length > 0) {
+                const latest = logs[logs.length - 1];
+                currentTrendEl.textContent = latest.trend;
+                trendMetricEl.className = `metric ${latest.trend}`;
+            }
+        });
+
+        socket.on('disconnect', () => {
+            statusEl.textContent = '🔄 Reconnecting...';
+            statusEl.style.color = '#ffaa00';
+        });
+
+        // Initial load
+        fetch('/api/logs').then(r => r.json()).then(renderLogs);
+        fetch('/health').then(r => r.json()).then(data => {
+            uptimeEl.textContent = (data.uptime / 3600).toFixed(1) + 'h';
+        }).catch(() => {
+            uptimeEl.textContent = 'N/A';
+        });
+    </script>
+</body>
+</html>
