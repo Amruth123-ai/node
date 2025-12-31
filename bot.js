@@ -5,19 +5,28 @@ const moment = require('moment-timezone');
 const path = require('path');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
+const fs = require('fs');
 
 const app = express();
 const server = createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
 // ==============================
-// CONFIG
+// SINGLE INSTANCE LOCK (CRITICAL)
+let instanceLockFile = '.instance.lock';
+if (fs.existsSync(instanceLockFile)) {
+    console.log('❌ Another instance running. Exiting.');
+    process.exit(1);
+}
+fs.writeFileSync(instanceLockFile, Date.now().toString());
+
 // ==============================
+// CONFIG (same)
 const BASE_URL = "https://api.delta.exchange/v2/history/candles";
 const SYMBOL = "BTC_USDT";
 const RESOLUTION = "2h";
 const LIMIT = 200;
-const POLL_INTERVAL = 15000;
+const POLL_INTERVAL = 15000 * 2; // 30s to reduce spam
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
@@ -25,22 +34,22 @@ const CHAT_ID = process.env.CHAT_ID;
 const length1 = 8, a1 = 0.7, length2 = 5, a2 = 0.618;
 
 // ==============================
-// STATE
-// ==============================
+// STATE WITH DEBOUNCE
 let lastTrend = null;
 let lastCandleTs = null;
+let lastAlertTs = 0; // NEW: Alert cooldown
+const ALERT_COOLDOWN = 5 * 60 * 1000; // 5 minutes min between alerts
 let logs = [];
 
 app.use(express.static('public'));
 app.use(express.json());
 
-// Serve dashboard
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 // ==============================
-// EMA & T3 CALCULATIONS
+// EMA & T3 (unchanged)
 function ema(series, length) {
     const result = [];
     const multiplier = 2 / (length + 1);
@@ -63,8 +72,14 @@ function tillsonT3Series(high, low, close, length, a) {
 }
 
 // ==============================
-// TELEGRAM ALERTS
+// TELEGRAM WITH COOLDOWN
 async function sendTelegram(msg) {
+    const now = Date.now();
+    if (now - lastAlertTs < ALERT_COOLDOWN) {
+        console.log('⏳ Alert cooldown active');
+        return;
+    }
+    
     if (!BOT_TOKEN || !CHAT_ID) {
         console.log('Telegram: Env vars missing');
         return;
@@ -72,9 +87,10 @@ async function sendTelegram(msg) {
     try {
         await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             chat_id: CHAT_ID, 
-            text: msg.replace(/<[^>]*>/g, ''), // Strip HTML for Telegram
+            text: msg,
             parse_mode: 'HTML'
         }, { timeout: 15000 });
+        lastAlertTs = now;
         console.log('✅ Telegram sent');
     } catch (e) {
         console.error('Telegram error:', e.message);
@@ -82,7 +98,7 @@ async function sendTelegram(msg) {
 }
 
 // ==============================
-// DELTA EXCHANGE DATA
+// FETCH DATA (same)
 async function fetchData() {
     try {
         const nowSec = Math.floor(Date.now() / 1000);
@@ -92,12 +108,7 @@ async function fetchData() {
             start: (nowSec - LIMIT * 7200).toString(),
             end: nowSec.toString()
         };
-        const { data } = await axios.get(BASE_URL, { 
-            params, 
-            timeout: 15000,
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-        
+        const { data } = await axios.get(BASE_URL, { params, timeout: 15000 });
         if (!data.success || !data.result?.length) return null;
         
         return data.result
@@ -110,15 +121,14 @@ async function fetchData() {
                 close: parseFloat(c.close)
             })).sort((a, b) => a.timestamp - b.timestamp);
     } catch (e) {
-        console.error('Fetch error:', e.message);
         return null;
     }
 }
 
 // ==============================
-// MAIN STRATEGY LOOP
+// STRATEGY WITH EXTRA SAFEGUARDS
 async function strategyLoop() {
-    console.log('🚀 BTC T3 Trend Bot LIVE on Render!');
+    console.log('🚀 SINGLE INSTANCE BTC T3 Bot LIVE!');
     
     while (true) {
         try {
@@ -128,88 +138,64 @@ async function strategyLoop() {
                 continue;
             }
 
-            // T3 Calculations
-            const t3 = tillsonT3Series(
-                df.map(d => d.high), 
-                df.map(d => d.low), 
-                df.map(d => d.close), 
-                length1, a1
-            );
-            const t3f = tillsonT3Series(
-                df.map(d => d.high), 
-                df.map(d => d.low), 
-                df.map(d => d.close), 
-                length2, a2
-            );
+            const t3 = tillsonT3Series(df.map(d => d.high), df.map(d => d.low), df.map(d => d.close), length1, a1);
+            const t3f = tillsonT3Series(df.map(d => d.high), df.map(d => d.low), df.map(d => d.close), length2, a2);
 
-            // Trend Colors
             const color1 = t3.map((v, i) => i ? v > t3[i-1] ? 'green' : 'red' : 'yellow');
             const color2 = t3f.map((v, i) => i ? v > t3f[i-1] ? 'green' : 'red' : 'yellow');
 
             const last = df[df.length - 1];
-            const candleTs = Math.floor(last.timestamp);
+            const candleTs = Math.floor(last.timestamp / 1000 / 3600) * 3600 * 1000; // Hour boundary
             
             if (candleTs === lastCandleTs) {
                 await new Promise(r => setTimeout(r, POLL_INTERVAL));
                 continue;
             }
-            lastCandleTs = candleTs;
 
-            // Trend Logic
+            lastCandleTs = candleTs;
             const uptrend = color1.at(-1) === 'green' && color2.at(-1) === 'green';
             const downtrend = color1.at(-1) === 'red' && color2.at(-1) === 'red';
             
-            if (!uptrend && !downtrend) {
-                await new Promise(r => setTimeout(r, POLL_INTERVAL));
-                continue;
-            }
+            if (!uptrend && !downtrend) continue;
 
             const trend = uptrend ? 'UPTREND' : 'DOWNTREND';
             if (trend !== lastTrend) {
                 const istTime = moment(candleTs).tz('Asia/Kolkata').format('YYYY-MM-DD HH:mm IST');
-                
                 logs.push({ trend, time: istTime });
                 if (logs.length > 50) logs = logs.slice(-50);
                 
-                const msg = `${uptrend ? '🟢' : '🔴'} ${trend}\n${SYMBOL}: $${last.close.toLocaleString()}\n${RESOLUTION} ${istTime}`;
-                
+                const msg = `${uptrend ? '🟢' : '🔴'} <b>${trend}</b>\n${SYMBOL}: $${last.close.toLocaleString()}\n${RESOLUTION} ${istTime}`;
                 console.log(msg);
                 await sendTelegram(msg);
                 lastTrend = trend;
-                
-                // Real-time WebSocket
                 io.emit('log-update', logs);
             }
         } catch (e) {
-            console.error('Strategy error:', e.message);
+            console.error('Strategy:', e.message);
         }
         await new Promise(r => setTimeout(r, POLL_INTERVAL));
     }
 }
 
 // ==============================
-// API ENDPOINTS
+// API + WEBSOCKET (same)
 app.get('/api/logs', (req, res) => res.json(logs));
-app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'ok', 
-        trend: lastTrend, 
-        logs: logs.length,
-        uptime: process.uptime()
-    });
-});
+app.get('/health', (req, res) => res.json({ status: 'ok', trend: lastTrend, logs: logs.length, instance: 'single' }));
 
-// WebSocket connections
-io.on('connection', (socket) => {
-    console.log('📱 Client connected');
+io.on('connection', socket => {
     socket.emit('log-update', logs);
 });
 
+// Cleanup on exit
+process.on('SIGTERM', () => {
+    fs.unlinkSync(instanceLockFile);
+    process.exit(0);
+});
+
 // ==============================
-// START SERVER (Render Compatible)
+// START
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🌐 LIVE: https://node-it7w.onrender.com`);
-    console.log(`📊 API: https://node-it7w.onrender.com/api/logs`);
+    console.log(`🌐 https://node-it7w.onrender.com (SINGLE INSTANCE)`);
     strategyLoop().catch(console.error);
 });
