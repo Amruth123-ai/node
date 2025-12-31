@@ -24,11 +24,6 @@ const CHAT_ID = process.env.CHAT_ID;
 
 const length1 = 8, a1 = 0.7, length2 = 5, a2 = 0.618;
 
-if (!BOT_TOKEN || !CHAT_ID) {
-    console.error('❌ Set BOT_TOKEN and CHAT_ID in .env');
-    process.exit(1);
-}
-
 // ==============================
 // STATE
 // ==============================
@@ -39,8 +34,13 @@ let logs = [];
 app.use(express.static('public'));
 app.use(express.json());
 
+// Serve dashboard
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
 // ==============================
-// EMA & T3 (unchanged)
+// EMA & T3 CALCULATIONS
 function ema(series, length) {
     const result = [];
     const multiplier = 2 / (length + 1);
@@ -63,19 +63,26 @@ function tillsonT3Series(high, low, close, length, a) {
 }
 
 // ==============================
-// TELEGRAM
+// TELEGRAM ALERTS
 async function sendTelegram(msg) {
+    if (!BOT_TOKEN || !CHAT_ID) {
+        console.log('Telegram: Env vars missing');
+        return;
+    }
     try {
         await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-            chat_id: CHAT_ID, text: msg, parse_mode: 'HTML'
-        }, { timeout: 10000 });
+            chat_id: CHAT_ID, 
+            text: msg.replace(/<[^>]*>/g, ''), // Strip HTML for Telegram
+            parse_mode: 'HTML'
+        }, { timeout: 15000 });
+        console.log('✅ Telegram sent');
     } catch (e) {
         console.error('Telegram error:', e.message);
     }
 }
 
 // ==============================
-// FETCH DATA
+// DELTA EXCHANGE DATA
 async function fetchData() {
     try {
         const nowSec = Math.floor(Date.now() / 1000);
@@ -85,7 +92,12 @@ async function fetchData() {
             start: (nowSec - LIMIT * 7200).toString(),
             end: nowSec.toString()
         };
-        const { data } = await axios.get(BASE_URL, { params, timeout: 15000 });
+        const { data } = await axios.get(BASE_URL, { 
+            params, 
+            timeout: 15000,
+            headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
+        
         if (!data.success || !data.result?.length) return null;
         
         return data.result
@@ -98,14 +110,16 @@ async function fetchData() {
                 close: parseFloat(c.close)
             })).sort((a, b) => a.timestamp - b.timestamp);
     } catch (e) {
+        console.error('Fetch error:', e.message);
         return null;
     }
 }
 
 // ==============================
-// STRATEGY LOOP
+// MAIN STRATEGY LOOP
 async function strategyLoop() {
-    console.log('🚀 BTC T3 Trend Bot started!');
+    console.log('🚀 BTC T3 Trend Bot LIVE on Render!');
+    
     while (true) {
         try {
             const df = await fetchData();
@@ -114,22 +128,37 @@ async function strategyLoop() {
                 continue;
             }
 
-            const t3 = tillsonT3Series(df.map(d => d.high), df.map(d => d.low), df.map(d => d.close), length1, a1);
-            const t3f = tillsonT3Series(df.map(d => d.high), df.map(d => d.low), df.map(d => d.close), length2, a2);
+            // T3 Calculations
+            const t3 = tillsonT3Series(
+                df.map(d => d.high), 
+                df.map(d => d.low), 
+                df.map(d => d.close), 
+                length1, a1
+            );
+            const t3f = tillsonT3Series(
+                df.map(d => d.high), 
+                df.map(d => d.low), 
+                df.map(d => d.close), 
+                length2, a2
+            );
 
+            // Trend Colors
             const color1 = t3.map((v, i) => i ? v > t3[i-1] ? 'green' : 'red' : 'yellow');
             const color2 = t3f.map((v, i) => i ? v > t3f[i-1] ? 'green' : 'red' : 'yellow');
 
             const last = df[df.length - 1];
             const candleTs = Math.floor(last.timestamp);
+            
             if (candleTs === lastCandleTs) {
                 await new Promise(r => setTimeout(r, POLL_INTERVAL));
                 continue;
             }
             lastCandleTs = candleTs;
 
+            // Trend Logic
             const uptrend = color1.at(-1) === 'green' && color2.at(-1) === 'green';
             const downtrend = color1.at(-1) === 'red' && color2.at(-1) === 'red';
+            
             if (!uptrend && !downtrend) {
                 await new Promise(r => setTimeout(r, POLL_INTERVAL));
                 continue;
@@ -138,13 +167,17 @@ async function strategyLoop() {
             const trend = uptrend ? 'UPTREND' : 'DOWNTREND';
             if (trend !== lastTrend) {
                 const istTime = moment(candleTs).tz('Asia/Kolkata').format('YYYY-MM-DD HH:mm IST');
+                
                 logs.push({ trend, time: istTime });
                 if (logs.length > 50) logs = logs.slice(-50);
                 
-                const msg = `${uptrend ? '🟢' : '🔴'} <b>${trend}</b>\n${SYMBOL}: $${last.close.toLocaleString()}\n${RESOLUTION} ${istTime}`;
+                const msg = `${uptrend ? '🟢' : '🔴'} ${trend}\n${SYMBOL}: $${last.close.toLocaleString()}\n${RESOLUTION} ${istTime}`;
+                
                 console.log(msg);
                 await sendTelegram(msg);
                 lastTrend = trend;
+                
+                // Real-time WebSocket
                 io.emit('log-update', logs);
             }
         } catch (e) {
@@ -155,19 +188,28 @@ async function strategyLoop() {
 }
 
 // ==============================
-// ROUTES
-app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+// API ENDPOINTS
 app.get('/api/logs', (req, res) => res.json(logs));
-app.get('/health', (req, res) => res.json({ status: 'ok', trend: lastTrend, logs: logs.length }));
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: 'ok', 
+        trend: lastTrend, 
+        logs: logs.length,
+        uptime: process.uptime()
+    });
+});
 
-io.on('connection', socket => {
+// WebSocket connections
+io.on('connection', (socket) => {
+    console.log('📱 Client connected');
     socket.emit('log-update', logs);
 });
 
 // ==============================
-// START
-const PORT = process.env.PORT || 5000;
+// START SERVER (Render Compatible)
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🌐 http://localhost:${PORT}`);
+    console.log(`🌐 LIVE: https://node-it7w.onrender.com`);
+    console.log(`📊 API: https://node-it7w.onrender.com/api/logs`);
     strategyLoop().catch(console.error);
 });
